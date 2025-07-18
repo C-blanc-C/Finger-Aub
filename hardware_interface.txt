@@ -1,0 +1,362 @@
+// Arduino code for robotic hand control with linear actuators
+// This code runs on Arduino Mega 2560 or similar
+
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// PWM driver for controlling multiple actuators
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// Linear actuator configuration
+#define SERVOMIN  150  // Min pulse length count (out of 4096)
+#define SERVOMAX  600  // Max pulse length count (out of 4096)
+#define PWM_FREQ  50   // Analog servos run at ~50 Hz
+
+// Finger mapping to PWM channels
+const int THUMB_CHANNEL = 0;
+const int INDEX_CHANNEL = 1;
+const int MIDDLE_CHANNEL = 2;
+const int RING_CHANNEL = 3;
+const int PINKY_CHANNEL = 4;
+
+// Current positions (0-100%)
+float currentPositions[5] = {0, 0, 0, 0, 0};
+float targetPositions[5] = {0, 0, 0, 0, 0};
+
+// Smoothing parameters
+const float SMOOTHING_FACTOR = 0.15;  // Lower = smoother
+const float POSITION_THRESHOLD = 0.5; // Minimum change to update
+
+// Force sensors (analog pins)
+const int FORCE_PINS[5] = {A0, A1, A2, A3, A4};
+float forceReadings[5] = {0, 0, 0, 0, 0};
+
+// Safety limits
+const float MAX_FORCE = 800.0;  // Maximum safe force reading
+const float FORCE_LIMIT_PERCENT = 90.0;  // Reduce to this % if over limit
+
+// Communication protocol
+String inputBuffer = "";
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_INTERVAL = 20;  // 50Hz update rate
+
+// Feedback data
+struct FeedbackData {
+  float positions[5];
+  float forces[5];
+  float temperature;
+  unsigned long timestamp;
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Robotic Hand Controller v1.0");
+  
+  // Initialize PWM driver
+  pwm.begin();
+  pwm.setPWMFreq(PWM_FREQ);
+  
+  // Initialize force sensor pins
+  for (int i = 0; i < 5; i++) {
+    pinMode(FORCE_PINS[i], INPUT);
+  }
+  
+  // Set all actuators to open position
+  resetFingers();
+  
+  Serial.println("Ready for commands...");
+}
+
+void loop() {
+  // Read serial commands
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      processCommand(inputBuffer);
+      inputBuffer = "";
+    } else {
+      inputBuffer += c;
+    }
+  }
+  
+  // Update actuator positions
+  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+    updateActuators();
+    readForceSensors();
+    checkSafetyLimits();
+    sendFeedback();
+    lastUpdate = millis();
+  }
+}
+
+void processCommand(String command) {
+  // Parse command format: T:XX,I:XX,M:XX,R:XX,P:XX
+  // T=Thumb, I=Index, M=Middle, R=Ring, P=Pinky
+  
+  int thumbPos = extractValue(command, 'T');
+  int indexPos = extractValue(command, 'I');
+  int middlePos = extractValue(command, 'M');
+  int ringPos = extractValue(command, 'R');
+  int pinkyPos = extractValue(command, 'P');
+  
+  // Validate and set target positions
+  if (thumbPos >= 0) targetPositions[0] = constrain(thumbPos, 0, 100);
+  if (indexPos >= 0) targetPositions[1] = constrain(indexPos, 0, 100);
+  if (middlePos >= 0) targetPositions[2] = constrain(middlePos, 0, 100);
+  if (ringPos >= 0) targetPositions[3] = constrain(ringPos, 0, 100);
+  if (pinkyPos >= 0) targetPositions[4] = constrain(pinkyPos, 0, 100);
+  
+  // Special commands
+  if (command.startsWith("RESET")) {
+    resetFingers();
+  } else if (command.startsWith("STOP")) {
+    emergencyStop();
+  } else if (command.startsWith("CALIB")) {
+    calibrateActuators();
+  }
+}
+
+int extractValue(String data, char prefix) {
+  int index = data.indexOf(prefix);
+  if (index == -1) return -1;
+  
+  int colonIndex = data.indexOf(':', index);
+  if (colonIndex == -1) return -1;
+  
+  int commaIndex = data.indexOf(',', colonIndex);
+  if (commaIndex == -1) commaIndex = data.length();
+  
+  String valueStr = data.substring(colonIndex + 1, commaIndex);
+  return valueStr.toInt();
+}
+
+void updateActuators() {
+  // Smooth transition to target positions
+  for (int i = 0; i < 5; i++) {
+    float diff = targetPositions[i] - currentPositions[i];
+    
+    // Apply smoothing only if change is significant
+    if (abs(diff) > POSITION_THRESHOLD) {
+      currentPositions[i] += diff * SMOOTHING_FACTOR;
+      
+      // Set actuator position
+      setActuatorPosition(i, currentPositions[i]);
+    }
+  }
+}
+
+void setActuatorPosition(int finger, float percent) {
+  // Convert percentage to PWM value
+  int pwmValue = map(percent, 0, 100, SERVOMIN, SERVOMAX);
+  
+  // Get channel for finger
+  int channel = getChannelForFinger(finger);
+  
+  // Set PWM
+  pwm.setPWM(channel, 0, pwmValue);
+}
+
+int getChannelForFinger(int finger) {
+  switch (finger) {
+    case 0: return THUMB_CHANNEL;
+    case 1: return INDEX_CHANNEL;
+    case 2: return MIDDLE_CHANNEL;
+    case 3: return RING_CHANNEL;
+    case 4: return PINKY_CHANNEL;
+    default: return 0;
+  }
+}
+
+void readForceSensors() {
+  // Read and filter force sensor values
+  for (int i = 0; i < 5; i++) {
+    int rawReading = analogRead(FORCE_PINS[i]);
+    
+    // Convert to force units (requires calibration)
+    float force = mapFloat(rawReading, 0, 1023, 0, 1000);
+    
+    // Apply low-pass filter
+    forceReadings[i] = forceReadings[i] * 0.8 + force * 0.2;
+  }
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+void checkSafetyLimits() {
+  // Check force limits and adjust positions if needed
+  for (int i = 0; i < 5; i++) {
+    if (forceReadings[i] > MAX_FORCE) {
+      // Reduce position to safety limit
+      targetPositions[i] = min(targetPositions[i], FORCE_LIMIT_PERCENT);
+      
+      // Send warning
+      Serial.print("WARNING: Force limit exceeded on finger ");
+      Serial.println(i);
+    }
+  }
+  
+  // Temperature check (if sensor available)
+  float temp = readTemperature();
+  if (temp > 60.0) {  // 60°C limit
+    Serial.println("WARNING: Over temperature!");
+    emergencyStop();
+  }
+}
+
+float readTemperature() {
+  // Placeholder for temperature sensor reading
+  // In real implementation, read from temp sensor
+  return 25.0;  // Room temperature
+}
+
+void sendFeedback() {
+  // Send feedback data in JSON format
+  Serial.print("{\"pos\":[");
+  for (int i = 0; i < 5; i++) {
+    Serial.print(currentPositions[i], 1);
+    if (i < 4) Serial.print(",");
+  }
+  
+  Serial.print("],\"force\":[");
+  for (int i = 0; i < 5; i++) {
+    Serial.print(forceReadings[i], 1);
+    if (i < 4) Serial.print(",");
+  }
+  
+  Serial.print("],\"temp\":");
+  Serial.print(readTemperature(), 1);
+  
+  Serial.print(",\"time\":");
+  Serial.print(millis());
+  
+  Serial.println("}");
+}
+
+void resetFingers() {
+  // Open all fingers
+  for (int i = 0; i < 5; i++) {
+    targetPositions[i] = 0;
+    currentPositions[i] = 0;
+    setActuatorPosition(i, 0);
+  }
+  Serial.println("Fingers reset to open position");
+}
+
+void emergencyStop() {
+  // Stop all movement immediately
+  for (int i = 0; i < 5; i++) {
+    targetPositions[i] = currentPositions[i];
+  }
+  Serial.println("EMERGENCY STOP ACTIVATED");
+}
+
+void calibrateActuators() {
+  Serial.println("Starting calibration...");
+  
+  // Calibration sequence
+  for (int finger = 0; finger < 5; finger++) {
+    Serial.print("Calibrating finger ");
+    Serial.println(finger);
+    
+    // Move to fully open
+    setActuatorPosition(finger, 0);
+    delay(1000);
+    
+    // Move to fully closed slowly
+    for (int pos = 0; pos <= 100; pos += 5) {
+      setActuatorPosition(finger, pos);
+      delay(100);
+      
+      // Check force sensor
+      int force = analogRead(FORCE_PINS[finger]);
+      if (force > 500) {  // Hit object
+        Serial.print("Max position: ");
+        Serial.println(pos);
+        break;
+      }
+    }
+    
+    // Return to open
+    setActuatorPosition(finger, 0);
+    delay(500);
+  }
+  
+  Serial.println("Calibration complete");
+}
+
+// Advanced grip patterns for specific objects
+void executeGripPattern(String pattern) {
+  if (pattern == "PRECISION") {
+    // Precision grip (thumb and index)
+    targetPositions[0] = 80;  // Thumb
+    targetPositions[1] = 80;  // Index
+    targetPositions[2] = 20;  // Middle
+    targetPositions[3] = 10;  // Ring
+    targetPositions[4] = 10;  // Pinky
+  } else if (pattern == "POWER") {
+    // Power grip (all fingers)
+    for (int i = 0; i < 5; i++) {
+      targetPositions[i] = 70;
+    }
+  } else if (pattern == "TRIPOD") {
+    // Tripod grip (thumb, index, middle)
+    targetPositions[0] = 70;  // Thumb
+    targetPositions[1] = 70;  // Index
+    targetPositions[2] = 70;  // Middle
+    targetPositions[3] = 30;  // Ring
+    targetPositions[4] = 30;  // Pinky
+  }
+}
+
+// Helper functions for special movements
+void waveGesture() {
+  // Wave motion
+  for (int cycle = 0; cycle < 3; cycle++) {
+    for (int finger = 1; finger < 5; finger++) {  // Skip thumb
+      targetPositions[finger] = 80;
+      delay(200);
+      targetPositions[finger] = 0;
+    }
+  }
+}
+
+void countFingers(int number) {
+  // Display number with fingers
+  resetFingers();
+  delay(500);
+  
+  switch (number) {
+    case 1:
+      targetPositions[1] = 0;  // Index up
+      break;
+    case 2:
+      targetPositions[1] = 0;  // Index up
+      targetPositions[2] = 0;  // Middle up
+      break;
+    case 3:
+      targetPositions[1] = 0;  // Index up
+      targetPositions[2] = 0;  // Middle up
+      targetPositions[3] = 0;  // Ring up
+      break;
+    case 4:
+      for (int i = 1; i < 5; i++) {
+        targetPositions[i] = 0;  // All but thumb
+      }
+      break;
+    case 5:
+      // All fingers open (already done by reset)
+      break;
+  }
+  
+  // Close other fingers
+  for (int i = 0; i < 5; i++) {
+    if (targetPositions[i] == 0) {
+      targetPositions[i] = 0;  // Keep open
+    } else {
+      targetPositions[i] = 90;  // Close
+    }
+  }
+}
